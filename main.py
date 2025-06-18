@@ -1,14 +1,31 @@
+# /// script
+# dependencies = [
+#   "dotenv",
+#   "google-genai",
+#   "fastapi",
+#   "numpy",
+#   "aiohttp",
+#   "uvicorn"
+# ]
+# ///
+
+
+
 import os
 import json
 import numpy as np
 import re
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from dotenv import load_dotenv
-import logging
-import asyncio
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
 import aiohttp
+import asyncio
+import logging
+from fastapi.responses import JSONResponse
+import uvicorn
 import traceback
+from dotenv import load_dotenv
 
 from google import genai
 from google.genai import types
@@ -25,8 +42,27 @@ MAX_CONTEXT_CHUNKS = 4
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
-app = Flask(__name__)
-CORS(app)
+class QueryRequest(BaseModel):
+    question: str
+    image: Optional[str] = None  # Base64 encoded image
+
+class LinkInfo(BaseModel):
+    url: str
+    text: str
+
+class QueryResponse(BaseModel):
+    answer: str
+    links: List[LinkInfo]
+
+app = FastAPI(title="RAG Query API", description="API for querying the RAG knowledge base")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if not API_KEY:
     logger.error("API_KEY environment variable is not set. The application will not function correctly.")
@@ -99,7 +135,12 @@ async def get_embedding(text, max_retries=3):
                 raise Exception(error_msg)
             await asyncio.sleep(3 * retries)
 
-def get_image_description(image: str):
+def get_image_description(image: Optional[str]) -> str:
+    """
+    Dummy function to simulate extracting a description from an image.
+    This can be an image URL or a base64-encoded image string.
+    For now, returns a static description.
+    """
     if not image:
         return ""
     client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -110,7 +151,10 @@ def get_image_description(image: str):
         ),
         contents=image,
     )
+
+    # time.sleep(6) # request per minute 10 for this model 
     return response.text
+    # return "This is a dummy description of the provided image."
 
 async def process_multimodal_query(question, image_base64):
     try:
@@ -119,6 +163,7 @@ async def process_multimodal_query(question, image_base64):
             logger.info("No image provided, processing as text-only query")
             return await get_embedding(question)
         logger.info("Processing multimodal query with image")
+        # Dummy image description logic
         image_description = get_image_description(image_base64)
         combined_query = f"{question}\nImage context: {image_description}"
         return await get_embedding(combined_query)
@@ -169,6 +214,7 @@ def enrich_with_adjacent_chunks(results, chunks, metadata):
         source = result["source"]
 
         additional_content = ""
+        # Previous chunk
         prev_idx = None
         next_idx = None
         for i, meta in enumerate(metadata):
@@ -299,35 +345,35 @@ def parse_llm_response(response):
             "links": []
         }
 
-def run_async(coro):
-    return asyncio.run(coro)
-
-@app.route("/query", methods=["POST"])
-def query_knowledge_base():
+@app.post("/query")
+async def query_knowledge_base(request: QueryRequest):
     try:
-        req_json = request.get_json()
-        question = req_json.get("question", "")
-        image = req_json.get("image", None)
-        logger.info(f"Received query request: question='{question[:50]}...', image_provided={image is not None}")
+        logger.info(f"Received query request: question='{request.question[:50]}...', image_provided={request.image is not None}")
         if not API_KEY:
             error_msg = "API_KEY environment variable not set"
             logger.error(error_msg)
-            return jsonify({"error": error_msg}), 500
+            return JSONResponse(
+                status_code=500,
+                content={"error": error_msg}
+            )
         chunks, embeddings, metadata = load_npz_data()
         logger.info("Processing query and generating embedding")
-        query_embedding = run_async(process_multimodal_query(question, image))
+        query_embedding = await process_multimodal_query(
+            request.question,
+            request.image
+        )
         logger.info("Finding similar content")
         relevant_results = find_similar_content(query_embedding, chunks, embeddings, metadata)
         if not relevant_results:
             logger.info("No relevant results found")
-            return jsonify({
+            return {
                 "answer": "I couldn't find any relevant information in my knowledge base.",
                 "links": []
-            })
+            }
         logger.info("Enriching results with adjacent chunks")
         enriched_results = enrich_with_adjacent_chunks(relevant_results, chunks, metadata)
         logger.info("Generating answer")
-        llm_response = run_async(generate_answer(question, enriched_results))
+        llm_response = await generate_answer(request.question, enriched_results)
         logger.info("Parsing LLM response")
         result = parse_llm_response(llm_response)
         if not result["links"]:
@@ -342,31 +388,33 @@ def query_knowledge_base():
                     links.append({"url": url, "text": snippet})
             result["links"] = links
         logger.info(f"Returning result: answer_length={len(result['answer'])}, num_links={len(result['links'])}")
-        return jsonify(result)
+        return result
     except Exception as e:
         error_msg = f"Unhandled exception in query_knowledge_base: {e}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
-        return jsonify({"error": error_msg}), 500
+        return JSONResponse(
+            status_code=500,
+            content={"error": error_msg}
+        )
 
-@app.route("/health", methods=["GET"])
-def health_check():
+@app.get("/health")
+async def health_check():
     try:
         chunks, embeddings, metadata = load_npz_data()
-        return jsonify({
+        return {
             "status": "healthy",
             "npz_loaded": True,
             "api_key_set": bool(API_KEY),
             "num_chunks": len(chunks),
             "num_embeddings": len(embeddings)
-        })
+        }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        return jsonify({
-            "status": "unhealthy",
-            "error": str(e),
-            "api_key_set": bool(API_KEY)
-        }), 500
+        return JSONResponse(
+            status_code=500,
+            content={"status": "unhealthy", "error": str(e), "api_key_set": bool(API_KEY)}
+        )
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    uvicorn.run("app:app", port=8000, reload=True)

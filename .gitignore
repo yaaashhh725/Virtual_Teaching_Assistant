@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Unnessary and testing files / folders
+ans/
+course/
+trial/
+extract_images_v2.py
+extract_images.py
+extracted_images_links.json
+image.html
+json_to_md.py
+json_to_md2.py
+json_to_md3.py
+preprocess.py
+embeddings.npz
+todo
+# Virtual environments
+.venv
+co
